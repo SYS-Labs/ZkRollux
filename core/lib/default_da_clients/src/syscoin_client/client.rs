@@ -73,6 +73,10 @@ impl DataAvailabilityClient for SyscoinClient {
     fn clone_boxed(&self) -> Box<dyn DataAvailabilityClient> {
         Box::new(self.clone())
     }
+
+    fn blob_size_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
