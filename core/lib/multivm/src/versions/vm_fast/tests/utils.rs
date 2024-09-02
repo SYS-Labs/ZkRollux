@@ -6,12 +6,13 @@ use vm2::{instruction_handlers::HeapInterface, HeapId, State};
 use zksync_contracts::{
     load_contract, read_bytecode, read_zbin_bytecode, BaseSystemContracts, SystemContractCode,
 };
-use zksync_state::ReadStorage;
 use zksync_types::{
     utils::storage_key_for_standard_token_balance, AccountTreeId, Address, StorageKey, H160, H256,
     U256,
 };
 use zksync_utils::{bytecode::hash_bytecode, bytes_to_be_words, h256_to_u256, u256_to_h256};
+
+use crate::interface::storage::ReadStorage;
 
 pub(crate) static BASE_SYSTEM_CONTRACTS: Lazy<BaseSystemContracts> =
     Lazy::new(BaseSystemContracts::load_from_disk);
@@ -124,5 +125,10 @@ pub(crate) fn get_complex_upgrade_abi() -> Contract {
 pub(crate) fn read_expensive_contract() -> (Vec<u8>, Contract) {
     const PATH: &str =
         "etc/contracts-test-data/artifacts-zk/contracts/expensive/expensive.sol/Expensive.json";
+    (read_bytecode(PATH), load_contract(PATH))
+}
+
+pub(crate) fn read_proxy_counter_contract() -> (Vec<u8>, Contract) {
+    const PATH: &str = "etc/contracts-test-data/artifacts-zk/contracts/counter/proxy_counter.sol/ProxyCounter.json";
     (read_bytecode(PATH), load_contract(PATH))
 }

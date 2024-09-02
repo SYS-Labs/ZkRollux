@@ -6,12 +6,7 @@ use vm2::{
 };
 use zk_evm_1_5_0::zkevm_opcode_defs::system_params::INITIAL_FRAME_FORMAL_EH_LOCATION;
 use zksync_contracts::SystemContractCode;
-use zksync_state::ReadStorage;
 use zksync_types::{
-    event::{
-        extract_l2tol1logs_from_l1_messenger, extract_long_l2_to_l1_messages,
-        L1_MESSENGER_BYTECODE_PUBLICATION_EVENT_SIGNATURE,
-    },
     l1::is_l1_tx_type,
     l2_to_l1_log::UserL2ToL1Log,
     utils::key_for_eth_balance,
@@ -35,9 +30,13 @@ use super::{
 use crate::{
     glue::GlueInto,
     interface::{
-        BytecodeCompressionError, Halt, TxRevertReason, VmInterface, VmInterfaceHistoryEnabled,
-        VmRevertReason,
+        storage::ReadStorage, BytecodeCompressionError, CompressedBytecodeInfo,
+        CurrentExecutionState, ExecutionResult, FinishedL1Batch, Halt, L1BatchEnv, L2BlockEnv,
+        Refunds, SystemEnv, TxRevertReason, VmEvent, VmExecutionLogs, VmExecutionMode,
+        VmExecutionResultAndLogs, VmExecutionStatistics, VmInterface, VmInterfaceHistoryEnabled,
+        VmMemoryMetrics, VmRevertReason,
     },
+    utils::events::extract_l2tol1logs_from_l1_messenger,
     vm_fast::{
         bootloader_state::utils::{apply_l2_block, apply_pubdata_to_memory},
         events::merge_events,
@@ -49,9 +48,7 @@ use crate::{
             get_vm_hook_params_start_position, get_vm_hook_position, OPERATOR_REFUNDS_OFFSET,
             TX_GAS_LIMIT_OFFSET, VM_HOOK_PARAMS_COUNT,
         },
-        BootloaderMemory, CurrentExecutionState, ExecutionResult, FinishedL1Batch, L1BatchEnv,
-        L2BlockEnv, MultiVMSubversion, Refunds, SystemEnv, VmExecutionLogs, VmExecutionMode,
-        VmExecutionResultAndLogs, VmExecutionStatistics,
+        MultiVMSubversion,
     },
 };
 
@@ -205,7 +202,7 @@ impl<S: ReadStorage> Vm<S> {
                             event.address == L1_MESSENGER_ADDRESS
                                 && !event.indexed_topics.is_empty()
                                 && event.indexed_topics[0]
-                                    == *L1_MESSENGER_BYTECODE_PUBLICATION_EVENT_SIGNATURE
+                                    == VmEvent::L1_MESSENGER_BYTECODE_PUBLICATION_EVENT_SIGNATURE
                         })
                         .map(|event| {
                             let hash = U256::from_big_endian(&event.value[..32]);
@@ -219,7 +216,7 @@ impl<S: ReadStorage> Vm<S> {
 
                     let pubdata_input = PubdataInput {
                         user_logs: extract_l2tol1logs_from_l1_messenger(&events),
-                        l2_to_l1_messages: extract_long_l2_to_l1_messages(&events),
+                        l2_to_l1_messages: VmEvent::extract_long_l2_to_l1_messages(&events),
                         published_bytecodes,
                         state_diffs: self
                             .compute_state_diffs()
@@ -348,6 +345,10 @@ impl<S: ReadStorage> Vm<S> {
     pub(crate) fn decommitted_hashes(&self) -> impl Iterator<Item = U256> + '_ {
         self.inner.world_diff.decommitted_hashes()
     }
+
+    fn gas_remaining(&self) -> u32 {
+        self.inner.state.current_frame.gas
+    }
 }
 
 // We don't implement `VmFactory` trait because, unlike old VMs, the new VM doesn't require storage to be writable;
@@ -408,6 +409,39 @@ impl<S: ReadStorage> Vm<S> {
         me.write_to_bootloader_heap(bootloader_memory);
 
         me
+    }
+
+    // visible for testing
+    pub(super) fn get_current_execution_state(&self) -> CurrentExecutionState {
+        let world_diff = &self.inner.world_diff;
+        let events = merge_events(world_diff.events(), self.batch_env.number);
+
+        let user_l2_to_l1_logs = extract_l2tol1logs_from_l1_messenger(&events)
+            .into_iter()
+            .map(Into::into)
+            .map(UserL2ToL1Log)
+            .collect();
+
+        CurrentExecutionState {
+            events,
+            deduplicated_storage_logs: world_diff
+                .get_storage_changes()
+                .map(|((address, key), (_, value))| StorageLog {
+                    key: StorageKey::new(AccountTreeId::new(address), u256_to_h256(key)),
+                    value: u256_to_h256(value),
+                    kind: StorageLogKind::RepeatedWrite, // Initialness doesn't matter here
+                })
+                .collect(),
+            used_contract_hashes: self.decommitted_hashes().collect(),
+            system_logs: world_diff
+                .l2_to_l1_logs()
+                .iter()
+                .map(|x| x.glue_into())
+                .collect(),
+            user_l2_to_l1_logs,
+            storage_refunds: world_diff.storage_refunds().to_vec(),
+            pubdata_costs: world_diff.pubdata_costs().to_vec(),
+        }
     }
 
     fn delete_history_if_appropriate(&mut self) {
@@ -499,7 +533,7 @@ impl<S: ReadStorage> VmInterface for Vm<S> {
                 contracts_used: 0,
                 cycles_used: 0,
                 gas_used: 0,
-                gas_remaining: 0,
+                gas_remaining: self.gas_remaining(),
                 computational_gas_used: 0,
                 total_log_queries: 0,
                 pubdata_published: (pubdata_after - pubdata_before).max(0) as u32,
@@ -515,7 +549,7 @@ impl<S: ReadStorage> VmInterface for Vm<S> {
         tx: zksync_types::Transaction,
         with_compression: bool,
     ) -> (
-        Result<(), BytecodeCompressionError>,
+        Result<Vec<CompressedBytecodeInfo>, BytecodeCompressionError>,
         VmExecutionResultAndLogs,
     ) {
         self.push_transaction_inner(tx, 0, with_compression);
@@ -524,69 +558,23 @@ impl<S: ReadStorage> VmInterface for Vm<S> {
         let compression_result = if self.has_unpublished_bytecodes() {
             Err(BytecodeCompressionError::BytecodeCompressionFailed)
         } else {
-            Ok(())
+            Ok(self.bootloader_state.get_last_tx_compressed_bytecodes())
         };
         (compression_result, result)
-    }
-
-    fn get_bootloader_memory(&self) -> BootloaderMemory {
-        self.bootloader_state.bootloader_memory()
-    }
-
-    fn get_last_tx_compressed_bytecodes(
-        &self,
-    ) -> Vec<zksync_utils::bytecode::CompressedBytecodeInfo> {
-        self.bootloader_state.get_last_tx_compressed_bytecodes()
     }
 
     fn start_new_l2_block(&mut self, l2_block_env: L2BlockEnv) {
         self.bootloader_state.start_new_l2_block(l2_block_env)
     }
 
-    fn get_current_execution_state(&self) -> CurrentExecutionState {
-        let world_diff = &self.inner.world_diff;
-        let events = merge_events(world_diff.events(), self.batch_env.number);
-
-        let user_l2_to_l1_logs = extract_l2tol1logs_from_l1_messenger(&events)
-            .into_iter()
-            .map(Into::into)
-            .map(UserL2ToL1Log)
-            .collect();
-
-        CurrentExecutionState {
-            events,
-            deduplicated_storage_logs: world_diff
-                .get_storage_changes()
-                .map(|((address, key), (_, value))| StorageLog {
-                    key: StorageKey::new(AccountTreeId::new(address), u256_to_h256(key)),
-                    value: u256_to_h256(value),
-                    kind: StorageLogKind::RepeatedWrite, // Initialness doesn't matter here
-                })
-                .collect(),
-            used_contract_hashes: self.decommitted_hashes().collect(),
-            system_logs: world_diff
-                .l2_to_l1_logs()
-                .iter()
-                .map(|x| x.glue_into())
-                .collect(),
-            user_l2_to_l1_logs,
-            storage_refunds: world_diff.storage_refunds().to_vec(),
-            pubdata_costs: world_diff.pubdata_costs().to_vec(),
-        }
-    }
-
-    fn record_vm_memory_metrics(&self) -> crate::vm_latest::VmMemoryMetrics {
+    fn record_vm_memory_metrics(&self) -> VmMemoryMetrics {
         todo!("Unused during batch execution")
     }
 
-    fn gas_remaining(&self) -> u32 {
-        self.inner.state.current_frame.gas
-    }
-
     fn finish_batch(&mut self) -> FinishedL1Batch {
-        let result = self.execute(VmExecutionMode::Batch);
+        let result = self.inspect((), VmExecutionMode::Batch);
         let execution_state = self.get_current_execution_state();
-        let bootloader_memory = self.get_bootloader_memory();
+        let bootloader_memory = self.bootloader_state.bootloader_memory();
         FinishedL1Batch {
             block_tip_execution_result: result,
             final_execution_state: execution_state,
